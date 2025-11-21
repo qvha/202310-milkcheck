@@ -1,0 +1,307 @@
+#
+# Local service
+#
+# This service will run "service crond status" command on specified target when
+# "status" action is called.
+#
+services:
+  # is the target responding to ping ?
+  fping:
+    desc: attempt ICMP ping 
+    mode: delegate
+    target: mesca5mod-02
+    actions:
+      status:
+        cmd: nodeset -S "\n" -e %TARGET | /usr/sbin/fping -r1 -u
+  # Is ssh enabled on the BMC ?
+  accessible bmc:
+    desc: can connect with ssh
+    target: mesca5mod-02
+    actions:
+      status:
+        cmd: fping $( ipmitool lan print 1 | grep "IP Address   " | tail -n 1 | colrm 1 26 )
+      fix:
+        cmd: >
+          zypper install -y fping ;
+          BMCIP=`ipmitool lan print 1 | grep "IP Address   " | tail -n 1 | colrm 1 26` ;
+          curl -sk -u admin:0penBmc* -H "Content-Type: application/json" -d '{"SSH": {"ProtocolEnabled": true}}' -X PATCH https://$BMCIP/redfish/v1/Managers/bmc0/NetworkProtocol
+  # utility filesystem : qvha
+  utility filesystem 1:
+    desc: qvha
+    target: mesca5mod-02
+    require: fping
+    actions:
+      status:
+        cmd: grep -q /home/qvha /etc/mtab
+      fix:
+        cmd: mount 10.197.184.62:/home/qvha /home/qvha 
+  # utility filesystem : bb8
+  utility filesystem 2:
+    desc: /outils/bb8/repo
+    target: mesca5mod-02
+    require: fping
+    actions:
+      status:
+        cmd: grep -q /outils/bb8/repo /etc/mtab
+      fix:
+        cmd: >
+          mkdir -p /outils/bb8/repo ;
+          mount 10.197.180.220:/outils/bb8/repo /outils/bb8/repo
+  # Is hyperthreading/SMT activated ? We want it on
+  SMT:
+    desc: hyperthreading is active
+    target: mesca5mod-02
+    require: fping 
+    actions:
+      status:
+        cmd: >
+             if [[ $(< /sys/devices/system/cpu/smt/active ) == "1" ]]; then
+                echo 1 ;
+             else 
+                echo ;
+             fi
+  BIOS:
+    desc: BIOS_SAR120.79.00.006
+    target: mesca5mod-02
+    require: fping
+    actions:
+      status:
+        cmd: >
+          DMI="$( /usr/sbin/dmidecode -t 0 )" ;
+          grep -q BIOS_SAR120.79.00.006 <<< "$DMI"
+  Memory:
+    desc: 16 x 64GB Samsung at 4800MT/s
+    target: mesca5mod-02
+    require: fping
+    actions:
+      status:
+        cmd: >
+          DMI="$( /usr/sbin/dmidecode -t 17 )" ;
+          (( $( grep "Configured Memory Speed: 4800 MT/s" <<< "$DMI" | wc -l ) == 16 )) &&
+          (( $( grep "Manufacturer: Micron"     <<< "$DMI" | wc -l ) == 16 )) &&
+          (( $( grep "Volatile Size: 64 GB" <<< "$DMI" | wc -l ) == 16 )) &&
+          (( $( grep "MTC40F2046S1RC48BA1" <<< "$DMI" | wc -l ) == 16 ))
+  BenchElem:
+    desc: is installed
+    target: mesca5mod-02
+    require: fping
+    actions:
+      status:
+        cmd: test -f "/usr/local/BenchElem/run.sh"
+  vtune:
+    desc: is installed
+    target: mesca5mod-02
+    require: fping
+    require: utility filesystem 2
+    actions:
+      status:
+        cmd: test -f "/outils/bb8/repo/oneapi/vtune/latest/bin64/amplxe-perf"
+  fan speed module 0:
+    desc: all maxed out
+    target: mesca5mod-02
+    require: accessible bmc  
+    require: utility filesystem 1
+    actions:
+      status:
+        cmd: >
+          BMCIP=$( ipmitool lan print 1 | grep "IP Address  " | tail -n 1 | colrm 1 26 );
+          curl -sk -u admin:0penBmc* -H "Content-Type:application/json" -X GET https://$BMCIP/redfish/v1/Chassis/Module0/Thermal --noproxy https://"$BMCIP" | /home/qvha/Projets/202310-milkcheck/fans.py
+          #      fix:    
+          #        cmd: curl -k -u admin:0penBmc* -H "Content-Type:application/json" -d '{"Oem":{"Eviden_com":{"FansFullSpeed": true}}}' -X PATCH 'https://%TARGET/redfish/v1/Chassis/Module0/Thermal'
+  transparent hugepage:
+    desc:  madvise
+    target: mesca5mod-02
+    require: fping
+    actions:
+      status:
+        cmd: grep --quiet "[madvise]" /sys/kernel/mm/transparent_hugepage/enabled 
+      fix:
+        cmd: echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+  clocksource:
+    desc: TSC 
+    target: mesca5mod-02
+    require: fping
+    actions:
+      status:
+        cmd: test `grep -q tsc /sys/devices/system/clocksource/clocksource0/current_clocksource` -a `grep -q "tsc=nowatchdog" /proc/cmdline`
+  home-latency:
+    desc: less than 130ns
+    target: mesca5mod-02
+    require: fping
+    require: BenchElem
+    require: utility filesystem 1
+    actions:
+      status:
+        cmd: test $( /home/qvha/Projets/202310-milkcheck/mlc.py | head -n 1 ) -lt 130
+  1hop-latency:
+    desc: less than 220ns
+    target: mesca5mod-02
+    require: BenchElem
+    require: home-latency
+    require: utility filesystem 1
+    actions:
+      status:
+        cmd: test $( /home/qvha/Projets/202310-milkcheck/mlc.py | tail -n 1 ) -lt 220
+  sep5:
+    desc: module is loaded
+    target: mesca5mod-02
+    require: utility filesystem 2
+    actions:
+      status:
+        cmd: lsmod| grep -q sep5
+      fix :
+        cmd: >
+          cd /outils/bb8/repo/oneapi/vtune/latest ;
+          . sep_vars.sh ;
+          cd sepdk/src ;
+          ./insmod-sep ;
+          # zypper install kernel-default kernel-devel ;
+          # cd $VTUNE/sepdk/src ; ./build-driver  ;./insmod-sep       
+  UPI bandwidth test:
+    desc: 6 well-balanced links above 14.4GB/s
+    target: mesca5mod-02
+    require: BenchElem
+    require: vtune
+    require: sep5  
+    require: utility filesystem 2
+    require: utility filesystem 1
+    after: 1hop-latency  
+    actions:
+      status:
+        cmd: >
+          . /outils/bb8/repo/oneapi/vtune/latest/env/vars.sh ;
+          LD_LIBRARY_PATH=/usr/local/BenchElem/lib_intel64 amplxe-perf stat --iostat=upi /usr/local/BenchElem/spr_linux_icx/dgemm -r 2 -t 10 2>&1 | /home/qvha/Projets/202310-milkcheck/dgemm.py --sockets 2 --upis 4
+  # dump bios settings once and for all, to be grep'ed many times
+  read-bios-settings:
+    desc: dump bios settings for analysis
+    target: mesca5mod-02
+    require: fping
+    actions:
+      status:
+        cmd: h2ouve-lx64 -gs /tmp/biossettings.csv -csv   
+  disable ACP:
+    target: mesca5mod-02
+    desc: "              should be <No>"  
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",Disable ACP,No," /tmp/biossettings.csv
+  SNC:
+    target: mesca5mod-02
+    desc: "                      should be <Enable SNC4 (4-clusters)>"  
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",SNC,Enable SNC4 (4-clusters)," /tmp/biossettings.csv
+  ENERGY_PERF_BIAS_CFG mode:
+    target: mesca5mod-02
+    desc: "should be <Performance0>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",ENERGY_PERF_BIAS_CFG mode,Performance0," /tmp/biossettings.csv
+  DCU Streamer Prefetcher:
+    target: mesca5mod-02
+    desc: "  should be <Disabled>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",DCU Streamer Prefetcher,Disabled," /tmp/biossettings.csv
+  Scalability:
+    target: mesca5mod-02
+    desc: "              should be <Enabled>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",Scalability,Enabled," /tmp/biossettings.csv
+  APS rocketing:
+    target: mesca5mod-02
+    desc: "            should be <Enabled>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",APS rocketing,Enabled," /tmp/biossettings.csv
+  Optimized Power Mode:
+    target: mesca5mod-02
+    desc: "     should be <Disabled>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",Optimized Power Mode,Disabled," /tmp/biossettings.csv
+  Power Performance Tuning:
+    target: mesca5mod-02
+    desc: " should be <BIOS Controls EPB>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",Power Performance Tuning,BIOS Controls EPB," /tmp/biossettings.csv
+  Directory Mode Enable:
+    target: mesca5mod-02
+    desc: "    should be <Enabled>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",Directory Mode Enable,Enabled," /tmp/biossettings.csv
+  Link L0p Enable:
+    target: mesca5mod-02
+    desc: "          should be <Enabled>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",Link L0p Enable,Enabled," /tmp/biossettings.csv
+  PL1 Time Window:
+    target: mesca5mod-02
+    desc: "          should be <448> seconds"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",PL1 Time Window,448," /tmp/biossettings.csv
+  PL2 Time Window:
+    target: mesca5mod-02
+    desc: "          should be <0.438> seconds"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",PL2 Time Window,0.438," /tmp/biossettings.csv
+  PL2 Power Limit:
+    target: mesca5mod-02
+    desc: "          should be <4000> W"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",PL2 Power Limit,4000," /tmp/biossettings.csv
+  VMX:
+    target: mesca5mod-02
+    desc: "                      should be <Disabled>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",VMX,Disabled," /tmp/biossettings.csv
+  Enable dIout tuning:
+    target: mesca5mod-02
+    desc: "      should be <Enabled>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",Enable dIout tuning,Enabled," /tmp/biossettings.csv
+  EPP Enable:
+    target: mesca5mod-02
+    desc: "               should be <Enabled>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",EPP Enable,Enabled," /tmp/biossettings.csv
+  DCU IP Prefetcher:
+    target: mesca5mod-02
+    desc: "        should be <Disabled>"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: grep --quiet ",DCU IP Prefetcher,Disabled," /tmp/biossettings.csv
+  Disabled UPI:
+    target: mesca5mod-02
+    desc: "        All disabled but s0-u0 s1-u1"
+    require: read-bios-settings
+    actions:
+      status:
+        cmd: test $( grep "Disable a single UPI port" /tmp/biossettings.csv | grep "Link Disable,Yes" | wc -l ) -eq 6
